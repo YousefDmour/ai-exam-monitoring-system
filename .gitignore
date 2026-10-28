@@ -3,8 +3,8 @@
 *.task
 
 # Generated outputs
+outputs/
 session_reports/
-# Uncomment if screenshots are generated automatically
 screenshots/
 
 # Python
@@ -22,3 +22,13 @@ env/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local credentials and editor files
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.pytest_cache/
+.coverage
+htmlcov/
