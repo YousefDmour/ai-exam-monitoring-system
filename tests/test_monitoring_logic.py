@@ -1,7 +1,7 @@
 import unittest
 from types import SimpleNamespace
 
-from monitoring_logic import (
+from examwatch.monitoring_logic import (
     EventTracker, calibration_baseline, classify_measurements, face_measurements,
 )
 
