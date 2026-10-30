@@ -6,6 +6,8 @@ import time
 from examwatch.video_timing import VideoTimeline
 from examwatch.evidence_clips import ClipRecorder
 from examwatch.camera_quality import assess_quality
+from examwatch.exam_rules import SUPPORTED_OBJECTS, validate_forbidden, model_object_classes, clip_window
+from examwatch.screen_calibration import screen_measurements, outside_screen
 from examwatch.monitoring_logic import (
     EventTracker, face_measurements, calibration_baseline, classify_measurements,
 )
@@ -13,7 +15,22 @@ from examwatch.monitoring_logic import (
 
 ROOT = Path(__file__).resolve().parents[1]
 
-def run_monitoring(settings, emit, stop_event, recalibrate_event):
+def run_monitoring(settings, emit, stop_event, recalibrate_event, controls=None):
+    if controls is not None and settings.get('source_type', 'Camera') == 'Camera':
+        from examwatch.camera_preparation import prepare_camera
+        prepared = prepare_camera(ROOT, settings, emit, stop_event, controls)
+        if prepared is None:
+            emit({'message': 'Camera closed. No exam session was started.', 'phase': 'closed'})
+            return
+        try:
+            return _run_analysis(settings, emit, stop_event, recalibrate_event, prepared)
+        finally:
+            prepared['cap'].release()
+            prepared['landmarker'].close()
+    return _run_analysis(settings, emit, stop_event, recalibrate_event)
+
+
+def _run_analysis(settings, emit, stop_event, recalibrate_event, prepared=None):
     # Imports stay inside the worker so the UI opens without vision packages.
     import cv2
     import mediapipe as mp
@@ -36,8 +53,11 @@ def run_monitoring(settings, emit, stop_event, recalibrate_event):
     PITCH_THRESHOLD = 0.15
     GAZE_THRESHOLD = 0.10
     OBJECT_CONFIDENCE = settings["confidence"]
-    OBJECT_CLASSES = {67: "CELL PHONE", 73: "BOOK", 74: "CLOCK"}
-    ALLOWED_OBJECTS = set(settings["allowed_objects"])
+    forbidden = validate_forbidden(settings.get('forbidden_objects',
+        [name for name in ('CELL PHONE', 'BOOK', 'CLOCK') if name not in settings.get('allowed_objects', [])]))
+    OBJECT_CLASSES = {}
+    ALLOWED_OBJECTS = set(SUPPORTED_OBJECTS) - set(forbidden)
+    clip_pre, clip_post = clip_window(settings.get('clip_duration_seconds', 10))
     MODEL_DIR = ROOT / "models"
     SCREENSHOT_DIR = ROOT / "outputs/screenshots"
     REPORT_DIR = ROOT / "outputs/session_reports"
@@ -51,21 +71,22 @@ def run_monitoring(settings, emit, stop_event, recalibrate_event):
     session_name = settings.get("session_name", "").strip() or f"Session {session_id}"
     session_start = time.monotonic()
     calibration_samples = []
-    baseline = None
-    last_timestamp_ms = -1
+    screen_envelope = prepared['screen_envelope'] if prepared else None
+    baseline = tuple(screen_envelope['center'][:3]) if screen_envelope else None
+    last_timestamp_ms = prepared['last_timestamp_ms'] if prepared else -1
     trackers = {
         reason: EventTracker(
             FACE_ABSENCE_SECONDS if reason == "FACE ABSENT" else MIN_EVENT_DURATION,
             RECOVERY_PERIOD,
         )
-        for reason in ("CELL PHONE", "BOOK", "CLOCK", "HEAD TURN", "HEAD PITCH",
-                       "EYE GAZE", "FACE ABSENT", "MULTIPLE FACES")
+        for reason in sorted(set(forbidden) | {'CELL PHONE', 'BOOK', 'CLOCK', 'HEAD TURN', 'HEAD PITCH',
+                                              'EYE GAZE', 'FACE ABSENT', 'MULTIPLE FACES'})
     }
     counters = dict.fromkeys(trackers, 0)
     events = []
     current_event = None
-    cap = None
-    landmarker = None
+    cap = prepared['cap'] if prepared else None
+    landmarker = prepared['landmarker'] if prepared else None
     timeline = None
     elapsed = 0.0
     end_reason = "stopped"
@@ -77,6 +98,7 @@ def run_monitoring(settings, emit, stop_event, recalibrate_event):
     try:
         emit({"message": "Loading detection models..."})
         model = YOLO(str(MODEL_DIR / "yolov8n.pt"))
+        OBJECT_CLASSES = model_object_classes(model.names, forbidden)
         options = mp_vision.FaceLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=str(MODEL_DIR / "face_landmarker.task")),
             running_mode=mp_vision.RunningMode.VIDEO,
@@ -84,16 +106,19 @@ def run_monitoring(settings, emit, stop_event, recalibrate_event):
             min_face_detection_confidence=0.5,
             min_tracking_confidence=0.5,
         )
-        landmarker = mp_vision.FaceLandmarker.create_from_options(options)
-        cap = cv2.VideoCapture(str(video_path) if is_video else CAMERA_INDEX)
+        if prepared is None:
+            landmarker = mp_vision.FaceLandmarker.create_from_options(options)
+            cap = cv2.VideoCapture(str(video_path) if is_video else CAMERA_INDEX)
         if not cap.isOpened():
             raise RuntimeError("Unable to open the video file." if is_video else
                                "Unable to open the camera. Check camera access and CAMERA_INDEX.")
         if is_video:
             timeline = VideoTimeline(cap.get(cv2.CAP_PROP_FPS))
         if settings.get('save_clips', True):
-            clips = ClipRecorder(ROOT / 'outputs/clips', session_id, cv2)
+            clips = ClipRecorder(ROOT / 'outputs/clips', session_id, cv2, pre=clip_pre, post=clip_post)
         loop_started = time.monotonic()
+        if prepared:
+            session_start = loop_started
 
         while not stop_event.is_set():
             ret, frame = cap.read()
@@ -114,6 +139,8 @@ def run_monitoring(settings, emit, stop_event, recalibrate_event):
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             timestamp_ms = max(last_timestamp_ms + 1, int(elapsed * 1000))
+            if prepared:
+                timestamp_ms = max(last_timestamp_ms + 1, int((time.monotonic() - prepared['timestamp_origin']) * 1000))
             last_timestamp_ms = timestamp_ms
             result = landmarker.detect_for_video(mp_image, timestamp_ms)
             face_count = len(result.face_landmarks)
@@ -139,14 +166,21 @@ def run_monitoring(settings, emit, stop_event, recalibrate_event):
                         signals["HEAD TURN"] = head_status != "FORWARD"
                         signals["HEAD PITCH"] = pitch_status != "LEVEL"
                         signals["EYE GAZE"] = gaze_status != "CENTER"
+                        if screen_envelope is not None:
+                            screen_values = screen_measurements(result.face_landmarks[0])
+                            away = screen_values is not None and outside_screen(screen_values, screen_envelope)
+                            signals['HEAD TURN'] = away and head_status != 'FORWARD'
+                            signals['HEAD PITCH'] = away and pitch_status != 'LEVEL'
+                            signals['EYE GAZE'] = away
+                            gaze_status = 'OUTSIDE SCREEN' if away else 'ON SCREEN' if screen_values else 'UNAVAILABLE'
                     else:
                         head_status = pitch_status = gaze_status = "CALIBRATING"
             elif face_count > 1:
                 head_status = pitch_status = gaze_status = "MULTIPLE FACES"
 
             detected_objects = set()
-            results = model(frame, classes=list(OBJECT_CLASSES),
-                            conf=OBJECT_CONFIDENCE, verbose=False)
+            results = (model(frame, classes=list(OBJECT_CLASSES), conf=OBJECT_CONFIDENCE, verbose=False)
+                       if OBJECT_CLASSES else [])
             for detection_result in results:
                 for box in detection_result.boxes:
                     name = OBJECT_CLASSES.get(int(box.cls[0]))
@@ -202,15 +236,16 @@ def run_monitoring(settings, emit, stop_event, recalibrate_event):
                       else "OBSERVING" if pending else "NORMAL")
             color = (0, 0, 255) if active_reasons else (0, 165, 255) if pending else (0, 200, 0)
             emit({
+                "phase": "exam" if prepared else "video_analysis" if is_video else "exam",
                 "frame": frame, "status": status, "faces": face_count,
                 "head": head_status, "pitch": pitch_status, "gaze": gaze_status,
                 "elapsed": elapsed, "events": len(events),
-                "calibration": len(calibration_samples) / CALIBRATION_FRAMES,
+                "calibration": 1.0 if screen_envelope else len(calibration_samples) / CALIBRATION_FRAMES,
                 "reasons": sorted(active_reasons),
                 "quality": quality,
                 "processing_fps": processed_frames / max(.001, time.monotonic() - loop_started),
             })
-            if recalibrate_event.is_set():
+            if recalibrate_event.is_set() and screen_envelope is None:
                 recalibrate_event.clear()
                 calibration_samples.clear()
                 baseline = None
@@ -223,9 +258,9 @@ def run_monitoring(settings, emit, stop_event, recalibrate_event):
     finally:
         processing_duration = time.monotonic() - session_start
         session_duration = timeline.duration if timeline is not None else (0.0 if is_video else processing_duration)
-        if cap is not None:
+        if cap is not None and prepared is None:
             cap.release()
-        if landmarker is not None:
+        if landmarker is not None and prepared is None:
             landmarker.close()
         if clips is not None:
             clips.close()
@@ -243,12 +278,16 @@ def run_monitoring(settings, emit, stop_event, recalibrate_event):
             "processed_frames": processed_frames,
             "processing_fps": processed_frames / max(.001, time.monotonic() - loop_started) if loop_started else 0,
             "quality_warning_frames": quality_warning_frames,
-            "clip_settings": {"enabled": settings.get('save_clips', True), "pre_seconds": 5,
-                              "post_seconds": 5, "fps": 10, "max_width": 640},
+            "clip_settings": {"enabled": settings.get('save_clips', True), "pre_seconds": clip_pre,
+                              "post_seconds": clip_post, "total_seconds": clip_pre + clip_post,
+                              "fps": 10, "max_width": 640},
             "duration_seconds": session_duration,
             "calibration_complete": baseline is not None,
             "baseline": baseline,
+            "screen_calibration": screen_envelope,
+            "timing_origin": "exam_start" if prepared else "media_start" if is_video else "analysis_start",
             "allowed_objects": sorted(ALLOWED_OBJECTS),
+            "forbidden_objects": forbidden,
             "thresholds": {
                 "minimum_event_seconds": MIN_EVENT_DURATION,
                 "recovery_seconds": RECOVERY_PERIOD,

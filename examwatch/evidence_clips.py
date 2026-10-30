@@ -54,7 +54,7 @@ class ClipRecorder:
                 raise RuntimeError('MJPG video codec unavailable')
             times = [sample[0] for sample in samples]
             end = min(times[-1], item['until'])
-            count = max(1, int((end - times[0]) * self.fps) + 1)
+            count = max(1, int(round((end - times[0]) * self.fps)))
             previous_index, image = -1, first
             for index in range(count):
                 sample_index = max(0, bisect_right(times, times[0] + index / self.fps) - 1)

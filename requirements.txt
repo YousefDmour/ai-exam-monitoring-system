@@ -4,6 +4,7 @@ numpy==1.26.4
 opencv-python==4.10.0.84
 ultralytics==8.4.126
 Pillow>=9.0
-reportlab>=4.0
-arabic-reshaper>=3.0
+reportlab==4.2.5; python_version < "3.10"
+reportlab>=4.0; python_version >= "3.10"
+arabic-reshaper>=3.0,<4
 python-bidi>=0.4

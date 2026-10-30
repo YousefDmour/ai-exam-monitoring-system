@@ -60,6 +60,7 @@ class VideoTimingTests(unittest.TestCase):
             python.vision = vision
             yolo = types.ModuleType('ultralytics')
             yolo.YOLO = Mock(return_value=Mock(return_value=[]))
+            yolo.YOLO.return_value.names = {67: 'cell phone', 73: 'book', 74: 'clock'}
             modules = {'cv2': cv, 'mediapipe': mp, 'mediapipe.tasks': tasks,
                        'mediapipe.tasks.python': python, 'mediapipe.tasks.python.vision': vision,
                        'ultralytics': yolo}

@@ -77,7 +77,7 @@ class EvidenceAndQualityTests(unittest.TestCase):
         cap = self.cv.VideoCapture(event['clip'])
         try:
             self.assertTrue(cap.isOpened())
-            self.assertEqual(int(cap.get(self.cv.CAP_PROP_FRAME_COUNT)), 101)
+            self.assertEqual(int(cap.get(self.cv.CAP_PROP_FRAME_COUNT)), 100)
             self.assertEqual(cap.get(self.cv.CAP_PROP_FPS), 10)
             ok, first = cap.read()
             self.assertTrue(ok)
@@ -97,6 +97,26 @@ class EvidenceAndQualityTests(unittest.TestCase):
         self.assertEqual(event['clip_status'], 'saved')
         self.assertTrue(event['clip_truncated'])
         self.assertLessEqual(len(recorder.buffer), 52)
+
+    def test_configured_clip_durations_are_encoded_as_total_seconds(self):
+        from examwatch.evidence_clips import ClipRecorder
+        from examwatch.exam_rules import clip_window
+        for duration in (5, 15):
+            pre, post = clip_window(duration)
+            recorder = ClipRecorder(Path(self.temp.name), str(duration), self.cv, pre=pre, post=post)
+            event = {}
+            frame = self.np.zeros((90, 160, 3), dtype=self.np.uint8)
+            trigger = int(pre * 10)
+            for index in range(duration * 10 + 1):
+                recorder.add_frame(frame, index / 10)
+                if index == trigger:
+                    recorder.trigger(event, pre, 1)
+            recorder.close()
+            cap = self.cv.VideoCapture(event['clip'])
+            try:
+                self.assertEqual(cap.get(self.cv.CAP_PROP_FRAME_COUNT) / cap.get(self.cv.CAP_PROP_FPS), duration)
+            finally:
+                cap.release()
 
     def test_dark_and_blurry_frames_block_calibration(self):
         from examwatch.camera_quality import assess_quality

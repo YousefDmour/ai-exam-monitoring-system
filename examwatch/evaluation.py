@@ -1,8 +1,8 @@
 """Reason-level interval evaluation against independently labeled ground truth."""
 import math
+from examwatch.exam_rules import SUPPORTED_OBJECTS
 
-REASONS = ('CELL PHONE', 'BOOK', 'CLOCK', 'HEAD TURN', 'HEAD PITCH',
-           'EYE GAZE', 'FACE ABSENT', 'MULTIPLE FACES')
+REASONS = SUPPORTED_OBJECTS + ('HEAD TURN', 'HEAD PITCH', 'EYE GAZE', 'FACE ABSENT', 'MULTIPLE FACES')
 
 
 def annotation_template(report):
